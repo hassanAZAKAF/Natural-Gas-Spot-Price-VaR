@@ -1,0 +1,707 @@
+---
+title: "Natural Gas Spot Price VaR"
+output: html_notebook
+---
+# Introduction 
+This project takes inspiration from the 2021–2023 global energy crisis. Triggered by post-pandemic economic rebound and exacerbated by the Russian invasion of Ukraine, this crisis led to record-high natural gas and electricity prices. Our objective is to calculate a robust Value at Risk (VaR) for risk assessment in gas market short positions. This is crucial in ensuring informed decision-making within the volatile energy landscape.
+
+```{r}
+library(quantmod)
+library(zoo)
+library(MASS)
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+```
+### Scrapping daily gas price from FRED
+
+```{r}
+gas <- getSymbols("DHHNGSP",src="FRED",auto.assign=FALSE)
+gas <- na.omit(gas)
+gas <- gas["1979-12-31/2022-12-31"]
+gas <- gas # we want daily returns
+```
+
+```{r}
+tail(gas)
+```
+```{r}
+plot(gas,type="l")
+```
+```{r}
+sum(is.na(gas))
+length(gas)
+```
+### Daily log return 
+```{r}
+logret <- as.numeric(diff(log(gas))[-1])
+head(logret, 3)
+```
+```{r}
+plot(logret,type="l")
+```
+### Normality of the daily returns
+```{r}
+hist(logret,breaks = 100,freq=F,ylim=c(0,18))
+xfit <- seq(min(logret),max(logret),length=length(logret))
+yfit <- dnorm(xfit,mean(logret),sd(logret))
+lines(xfit,yfit,col="red",lwd=2)
+lines(density(logret),col="blue",lwd=2)
+legend("topright", legend = c("Theoretical","Empirical"), 
+       col = c("red", "blue"), lty = 1, lwd=2, bty = "n")
+```
+```{r}
+plot(ecdf(na.omit(logret)),col="red")
+lines(x=xfit,y=cumsum(yfit)/max(cumsum(yfit)),col="blue")
+```
+
+```{r}
+qqnorm(logret, pch = 1, frame = FALSE)
+qqline(logret, col = "steelblue", lwd = 2)
+```
+Skewness and kurtosis of daily log returns
+```{r}
+library(moments)
+```
+
+```{r}
+skewness(logret)
+```
+```{r}
+kurtosis(logret)
+```
+The kurtosis of daily return is very high.
+```{r}
+jarque.test(as.vector(logret))
+```
+Si since p-value < 0.05, then the daily returns aren't normal.
+
+Daily return's distribution is skewed to the left, so we need to model it using another distribution.
+Fitting scaled Student distribution to log return using Maximum-likelihood.
+```{r}
+suppressWarnings(t.fit <- fitdistr(logret, "t"))
+```
+
+```{r}
+round(t.fit$estimate,6)
+```
+```{r}
+library(metRology)
+```
+
+
+```{r}
+hist(logret,breaks = 100,freq=F,ylim=c(0,18))
+xfit <- seq(min(logret),max(logret),length=length(logret))
+yfit <- dt.scaled(xfit,mean=t.fit$estimate[1],sd=t.fit$estimate[2],df=t.fit$estimate[3])
+lines(xfit,yfit,col="red",lwd=2)
+lines(density(logret),col="blue",lwd=2)
+legend("topright", legend = c("Theoretical","Empirical"), 
+       col = c("red", "blue"), lty = 1, lwd=2, bty = "n")
+```
+QQ-Plot
+```{r}
+returns.sample <- rt.scaled(length(logret),mean=t.fit$estimate[1],sd=t.fit$estimate[2],df=t.fit$estimate[3])
+ordered.returns.sample <- returns.sample[order(returns.sample)]
+vector.logret <- as.vector(logret)
+ordred.logret <- vector.logret[order(vector.logret)]
+plot(ordered.returns.sample,ordred.logret,main="QQ plot for Scaled Student's t-distribution",xlab="Theoretical quantiles", ylab="Sample quantiles")
+abline(0,1,col="steelblue",lwd=2)
+```
+```{r}
+plot(ecdf(returns.sample),col="red")
+lines(ecdf(logret),col="blue")
+legend("topright", legend = c("Theoretical","Empirical"), 
+       col = c("red", "blue"), lty = 1, lwd=2, bty = "n")
+```
+
+```{r}
+ks.test(returns.sample,logret)
+```
+From the the Q-Q plot we Formulate the hypothesis that the dt-distribution is a good candidate for return distribution, however the Kolmogorov-Smirnov test reject this hypothesis.
+Estimating VaR and ES using Scaled Student's t-distribution
+$$
+\text{Let  } L \text{ be the loss of the gas prices and } n \text{ be the length of } L
+$$
+$$
+\text{VaR is defined as : } VaR_{\alpha} = inf( l \in \mathbb{R}, P(L>\alpha)≤ 1 − \alpha)
+$$
+$$
+\text{We estimate the expected shortfall using conditional expectation : } ES_{\alpha} =  \mathbb{E}(L | L ≥ VaRα).
+$$
+
+```{r}
+VaR.scaled.student <- function(alpha){
+var <- qt.scaled(alpha,mean=t.fit$estimate[1],sd=t.fit$estimate[2],df=t.fit$estimate[3])
+return(as.numeric(var))
+}
+VaR <- VaR.scaled.student(0.01)
+return.sample <- rt.scaled(100000,mean=t.fit$estimate[1],sd=t.fit$estimate[2],df=t.fit$estimate[3])
+ES <- mean(return.sample[return.sample<VaR]) 
+```
+
+```{r}
+c(VaR,ES)
+```
+## Extreme Value theory
+The presence of serious changes in the gas price disrupts the assumption of homogeneous risks.
+We will apply some of the fundamentals of extreme value theory to determine
+determine a threshold at which a loss can be considered atypical.
+
+```{r}
+library(evir)
+```
+page 139, use monte carlo simulation (generate from gdp distribution) to asses the risk
+### Threshold Selection
+#### Pareto Quantile Plot 
+$$
+\text{Let } X_{1, n} \leq \ldots \leq X_{n, n} \text{ the order statistics of X} \\
+\text{Then Pareto quantile plot corresponds to } \left(\ln \left(\frac{n+1}{j}\right), \ln \left(X_{n-j+1, n}\right)\right) \text{ for } j \in [1,n]
+$$
+```{r}
+X <- -logret[logret<0]
+n <- length(X)
+log.X <- numeric(n)
+Standard.exp.quantiles <- numeric(n)
+orderd.X <- sort(as.vector(X))
+for(j in 1:n){
+  Standard.exp.quantiles[j] <- log((n+1)/j)
+  log.X[j] <- log(orderd.X[n-j+1])
+}
+```
+
+```{r}
+plot(Standard.exp.quantiles,log.X,xlab="Standard exponential quantiles",ylab="log(X)",main="Pareto quantile plot")
+```
+###  Generalized Quantile Plot
+$$
+\text{The Generalized Quantile Plot corresponds to }\left(\ln \left(\frac{n+1}{j+1}\right), \ln \left(U H_{j, n}\right)\right) \\
+\text{Where } U H_{j, n}=X_{n-j, n}\left(\frac{1}{j} \sum_{i=1}^{j} \ln \left(X_{n-i+1, n}\right)-\ln \left(X_{n-j, n}\right)\right)
+$$
+```{r}
+UH <- numeric(n)
+Standard.exp.quantiles <- numeric(n)
+for(j in 1:(n-1)){
+  Standard.exp.quantiles[j] <- log((n+1)/(j+1))
+  UH[j] <- 0
+  for(i in 1:j){
+    UH[j] <- UH[j]  + log(orderd.X[n-i+1]/orderd.X[n-j])
+  }
+  UH[j] <- UH[j]*orderd.X[n-j]/j
+}
+```
+
+```{r}
+plot(Standard.exp.quantiles,log(UH))
+```
+The extreme points form a straight line with a positive slope, which means we are in the Fréchet domain.
+### Threshold Stability Plot
+
+```{r}
+library(POT)
+```
+
+```{r}
+tcplot(X,u.range=c(0,quantile(X,probs=0.99)))
+mrlplot(X,u.range=c(0,quantile(X,probs=0.99)),col=c("red","black","red"))
+```
+According to the analysis of the two graphs, parameter stabilization is significant above 0.12.
+### Mean Excess Plot
+$$
+e(u) = E(X-u|X>u)
+$$
+According to the analysis of the Mean Excess Plot, above 0.12 the mean excess estimate is linear with positive slope which indicate that the log returns follow a Generalized Pareto distribution with a positive tail parameter.
+
+```{r}
+THreshold <- 0.12
+```
+## Peak Over Threshold
+```{r}
+extreme.logret <- X[X > THreshold]
+```
+
+```{r}
+summary(extreme.logret)
+```
+
+```{r}
+length(extreme.logret)
+```
+
+```{r}
+hist(extreme.logret,main="Histogram of Extrem log returns",freq=F,ylim=c(0,13))
+lines(density(extreme.logret),col="blue")
+```
+
+### Generalized pareto distribution
+
+$$
+GPD(\mu,\sigma,\xi) : f_{(\mu,\sigma,\xi)}(x) = \frac{1}{\sigma}(1+\xi(\frac{x-\mu}{\sigma}))^{-(1+\frac{1}{\xi})} 
+$$
+```{r}
+library(eva)
+```
+
+```{r}
+mle_fit <- gpdFit(X, threshold = THreshold, method = "mle")
+```
+
+```{r}
+mle_fit$par.ests
+```
+
+
+```{r}
+mle_fit
+```
+The shape is positive then we are modeling a pareto distribution 
+$$
+GPD(\mu,\sigma,\xi) : f_{(\mu,\sigma,\xi)}(x) = \frac{1}{\sigma}(1+\xi(\frac{x-\mu}{\sigma}))^{-(1+\frac{1}{\xi})} 
+$$
+```{r}
+Pareto.pdf <- function(x,location,scale,shape){
+  a <- 1+(1/shape)
+  b <- (x-location)/scale
+  return((1+shape*b)^(-a)/scale)
+}
+```
+
+```{r}
+# Set the estimated parameters
+location <- THreshold
+scale <- as.numeric(mle_fit$par.ests[1])
+shape <- as.numeric(mle_fit$par.ests[2])	
+hist(extreme.logret,freq = F,breaks=50)
+x <- seq(from = 0, to = max(extreme.logret), length.out = 100)
+lines(density(extreme.logret),col='blue',lwd=2)
+lines(x,y=Pareto.pdf(x,location,scale,shape),type="l",col="red",lwd=2)
+legend("topright", legend = c("Theoretical","Empirical"), 
+       col = c("red", "blue"), lty = 1, lwd=2, bty = "n")
+```
+QQ-Plot
+```{r}
+library(evmix)
+```
+
+
+```{r}
+returns.sample <- rgpd(n = length(extreme.logret), u = location, sigmau = scale, xi = shape, phiu = 1)
+ordered.returns.sample <- sort(returns.sample)
+vector.logret <- as.vector(extreme.logret)
+ordred.logret <- sort(vector.logret)
+plot(ordered.returns.sample,ordred.logret,main="QQ plot for pareto distribution",xlab="Theoretical quantiles", ylab="Sample quantiles")
+abline(0,1,col="steelblue",lwd=2)
+```
+```{r}
+plot(ecdf(vector.logret),col="red")
+lines(ecdf(ordred.logret),col="blue")
+legend("topright", legend = c("Theoretical","Empirical"), 
+       col = c("red", "blue"), lty = 1, lwd=2, bty = "n")
+```
+
+## Calculate VaR
+
+$$
+\text{Let denote the cumulative distribution function of } {\displaystyle X\sim GPD(\mu ,\sigma ,\xi )} \text{ by } G(x): \\
+{\displaystyle    G_{(\mu ,\sigma ,\xi )}(x)={\begin{cases}1-\left(1+{\frac {\xi (x-\mu )}{\sigma }}\right)^{-1/\xi }&{\text{for }}\xi \neq 0,\\1-\exp \left(-{\frac {x-\mu }{\sigma }}\right)&{\text{for }}\xi =0,\end{cases}}} \\
+{\displaystyle    G_{(\mu ,\sigma ,\xi )}^{-1}(x)={\begin{cases} \mu+\frac{\sigma}{\xi}((\frac{1}{1-x})^{\xi}-1)
+&{\text{for }}\xi \neq 0,\\
+\mu+\sigma\ln \left({\frac {1}{1-x}}\right)&{\text{for }}\xi =0,\end{cases}}}
+$$
+```{r}
+Pareto.cdf <- function(x,location,scale,shape){
+  a <- shape*(x-location)/scale
+  b <- -1/shape
+  return(1-(1+a)^b)
+}
+```
+
+```{r}
+x <- seq(from = 0, to = as.integer(max(extreme.logret)), length.out = 100)
+plot(x,Pareto.cdf(x,location,scale,shape),type="l")
+```
+
+
+```{r}
+Inverse.cdf.Pareto <- function(x,location,scale,shape){
+  a <- scale/shape
+  b <- (1/(1-x))^shape
+  return(location+a*(b-1))
+}
+```
+
+$$
+\text{Let X} <\mu \text{ , } \mu \in \mathbb{R_{-}}  \text{ and }  N_\mu = Card(t,T_t<\mu , t \in [1 ... n]) :\\  
+{G}_{(\mu ,\sigma ,\xi )}(x) = P(X<x|X<\mu)  = \frac{P(X<x,X<\mu)}{P(X<\mu)} = \frac{P(X<x)}{P(X<\mu)} = \frac{F(x)}{F(\mu)}  \\
+\text{We have : } {\displaystyle {\widehat {F}}(t)={\frac {1}{n}}\sum _{i=1}^{n}\mathbf {1} _{X_{i} < t}} \text{ then  : } {\widehat {F}}(\mu) = \frac{N_\mu}{n}
+\\
+\text{We have :} \alpha = F(VaR(\alpha)) = \frac{N_\mu}{n}G_{(\mu ,\sigma ,\xi )}(VaR(\alpha)) \\
+
+
+\text{Therefore : } VaR(\alpha) = -G_{(\mu ,\sigma ,\xi )}^{-1}(1-\frac{n}{N_\mu}\alpha) \\ 
+$$
+
+```{r}
+VaR <- function(alpha,location,scale,shape,n,N){
+  x <- 1-(n/N)*alpha
+  return(Inverse.cdf.Pareto(x,location,scale,shape))
+}
+```
+
+```{r}
+alpha <- 0.01
+N <- length(extreme.logret)
+n <- length(logret)
+Pareto.VaR <- as.numeric(-VaR(alpha,location,scale,shape,n,N))
+print(Pareto.VaR)
+```
+
+## Modeling annual maxima losses
+
+```{r}
+library(xts)
+```
+
+```{r}
+new.log.ret <- na.omit(diff(log(gas))[-1])
+```
+
+```{r}
+new.log.ret <- xts(new.log.ret$DHHNGSP, order.by = as.Date(index(new.log.ret)))
+```
+
+```{r}
+weekly.maxima <- -apply.weekly(new.log.ret, FUN = min)$DHHNGSP
+```
+
+```{r}
+length(weekly.maxima)
+```
+
+```{r}
+plot(weekly.maxima,type="l",xlab = "Week",ylab = "Maximum Loss")
+```
+
+
+```{r}
+hist(weekly.maxima,freq = F,ylim = c(0,17),breaks=50)
+lines(density(weekly.maxima),main="Histogram of Weekly Maximas",col="blue")
+```
+### Generalized extreme value distribution
+
+$$
+GEV(\mu,\sigma,\xi) : f_{(\mu,\sigma,\xi)}(x) = \frac{1}{\sigma}t(x)^{\xi+1}e^{-t(x)} \\
+\text{Where : } t(x) = \begin{cases}
+(1+\xi(\frac{x-\mu}{\sigma}))^{-\frac{1}{\xi}} & \text{if } \xi \neq 0 \\
+e^{-(\frac{x-\mu}{\sigma})} & \text{if }  \xi = 0
+\end{cases}
+$$
+```{r}
+library(extRemes)
+```
+
+```{r}
+fevd(weekly.maxima)
+```
+The shape is postive then we have Weibull distribution
+$$
+Weibull(\mu,\sigma,\xi) : f_{(\mu,\sigma,\xi)}(x) = \frac{1}{\sigma}t(x)^{\xi+1}e^{-t(x)} \\
+\text{Where : } t(x) =(1+\xi(\frac{x-\mu}{\sigma}))^{-\frac{1}{\xi}} 
+
+$$
+```{r}
+Weibull.pdf <- function(x,location,scale,shape){
+  t.x <- (1+(shape*(x-location))/(scale))^(-1/shape)
+  return(((1/scale)*t.x^(1+shape))*exp(-t.x))
+}
+```
+
+```{r}
+# Set the estimated parameters
+location <- 0.02676965  
+scale <- 0.02531254
+shape <- 0.13040335
+hist(weekly.maxima,freq = FALSE,ylim = c(0,17),breaks=50)
+x <- seq(from = 0,to = as.integer(max(weekly.maxima)), length.out = 100)
+lines(density(weekly.maxima),col="red",lwd=2)
+lines(x,y=Weibull.pdf(x,location,scale,shape),type="l",col="blue",lwd=2)
+legend("topright", legend = c("Theoretical","Empirical"), 
+       col = c("blue", "red"), lty = 1, lwd=2, bty = "n")
+```
+
+$$
+\text{The VaR is given by : } 
+VaR(\alpha) = \begin{cases}
+\mu-\frac{\sigma}{\xi}(1-(-m ln(\alpha)^{-{\xi}}) & \text{if } \xi \neq 0 \\
+\mu-\sigma ln(-m ln(\alpha)) & \text{if }  \xi = 0
+\end{cases}
+$$
+```{r}
+Weibull.VaR <- function(alpha,location,scale,shape,m){
+  return(location-(scale/shape)*(1-(-m*log(alpha))^(-shape)))
+}
+```
+
+```{r}
+m <- length(weekly.maxima)
+weibull.VaR <- Weibull.VaR(alpha,location,scale,shape,m)
+weibull.VaR
+```
+```{r}
+weibull.ES <- mean(logret[logret<weibull.VaR])
+weibull.ES
+```
+
+## Comparing different methods for computing risk measures
+```{r}
+risk.measures <- data.frame(
+  "Normal" = c(quantile(logret,alpha),mean(logret[logret<quantile(logret,alpha)])),
+  "Scaled Student" = c(VaR.scaled.student(alpha),mean(logret[logret<VaR.scaled.student(alpha)])),
+  "Pareto" = c(Pareto.VaR,mean(logret[logret<Pareto.VaR])),
+  "Weibull" = c(weibull.VaR,weibull.ES)
+)
+```
+
+```{r}
+row.names(risk.measures ) <- c("VaR","ES")
+```
+
+
+```{r}
+risk.measures
+```
+We remark the the method involving maximum blocks underestimate the VaR and ES while the peak over threshold methods estimates are close to the Scaled Student and Normal distribution estimates for VaR and ES.
+## Dynamic Value at Risk
+Previously we supposed that the value at risk is constant over time, but now we will consider it changing over time.
+### Volatility Analysis
+Before modeling volatility we need to verify if it is stationary :
+```{r}
+library(tseries)
+```
+
+```{r}
+adf.test(logret)
+```
+The p-value is 0.01 which means we have enough evidence to reject the null hypothesis "Log return are not stationary".
+Autocorrelation
+```{r}
+acf(logret) 
+```
+Serial correlation
+```{r}
+acf(abs(logret))
+```
+The log returns exhibit serial correlation, then Garch model would be a good fit for the daily returns
+Volatility clustering
+```{r}
+plot(logret,type="l")
+```
+High volatility are clustered in time.
+```{r}
+pacf(logret)
+```
+
+GARCH(1,1) Model : using normal distribution of residuals
+$$
+r_t = \mu + \epsilon_t = \mu + \sigma_t \eta_t \\
+\sigma_t^2 = \omega + \alpha \epsilon_t^2 + \beta \sigma_{t-1}^2 \\
+\text{Where } \eta_t \sim \mathbb{N(0,1)}
+$$
+
+```{r}
+library(rugarch)
+uspec <- ugarchspec( variance.model = list(model = "sGARCH",garchOrder = c(1,1)),
+ mean.model = list(armaOrder = c(0,0), include.mean = TRUE))
+fit.garch.1.1 <- ugarchfit(spec = uspec, data = logret) 
+```
+
+```{r}
+?ugarchfit
+```
+
+
+```{r}
+garch.1.1.results <- data.frame(
+  "logret" = logret, 
+  "sigma" = fit.garch.1.1@fit$sigma,
+  "residuals" = fit.garch.1.1@fit$z)
+```
+
+```{r}
+head(garch.1.1.results)
+```
+```{r}
+plot(as.vector(logret),type="l")
+lines(as.vector(garch.1.1.results$sigma),col="green",lwd=2)
+lines(-as.vector(garch.1.1.results$sigma),col="red",lwd=2)
+```
+
+Normality of the residuals :
+```{r}
+epsilon <- as.vector(garch.1.1.results$residuals)/as.vector(garch.1.1.results$sigma)
+hist(epsilon,main = "Histogram of epsilon",breaks=50,freq = F)
+xfit <- seq(min(epsilon),max(epsilon),length=length(epsilon))
+yfit <- dnorm(xfit,mean(epsilon),sd(epsilon))
+lines(xfit,yfit,col="red",lwd=2)
+lines(density(epsilon),col="blue",lwd=2)
+legend("topright", legend = c("Theoretical","Empirical"), 
+       col = c("red", "blue"), lty = 1, lwd=2, bty = "n")
+```
+```{r}
+plot(ecdf(epsilon),col="red")
+lines(x=xfit,y=cumsum(yfit)/max(cumsum(yfit)),col="blue")
+```
+```{r}
+qqnorm(epsilon, pch = 1, frame = FALSE)
+qqline(epsilon, col = "steelblue", lwd = 2)
+```
+```{r}
+jarque.test(epsilon)
+```
+The Jarque-Bera test shows that the residuals of the garch(1,1) model aren't normal.
+GARCH(1,1)-t Model : using scaled t-distribution
+$$
+r_t = \mu + \epsilon_t = \mu + \sigma_t \eta_t \\
+\sigma_t^2 = \omega + \alpha \epsilon_t^2 + \beta \sigma_{t-1}^2 \\
+\text{Where } \eta_t \sim t_v
+$$
+```{r}
+uspec <- ugarchspec( variance.model = list(model = "sGARCH",garchOrder = c(1,1)),
+ mean.model = list(armaOrder = c(0,0), include.mean = TRUE),
+ distribution.model = "std")
+fit.garch.t <- ugarchfit(spec = uspec, data = logret) 
+```
+
+```{r}
+print(fit.garch.t@fit$coef)
+```
+```{r}
+df.epsilon <- as.numeric(fit.garch.t@fit$coef[5])
+df.epsilon
+```
+
+```{r}
+fit.garch.t.results <- data.frame(
+  "logret" = logret, 
+  "sigma" = fit.garch.t@fit$sigma,
+  "residuals" = fit.garch.t@fit$z)
+
+```
+
+```{r}
+acf(fit.garch.t.results$residuals)
+```
+```{r}
+acf(abs(fit.garch.t.results$residuals))
+```
+```{r}
+plot(as.vector(logret),type="l")
+lines(as.vector(fit.garch.t.results$sigma),col="green")
+lines(-as.vector(fit.garch.t.results$sigma),col="red")
+```
+```{r}
+epsilon.t <- as.vector(fit.garch.t.results$residuals)
+epsilon.t.fit <- fitdistr(as.vector(epsilon.t), "t")
+```
+```{r}
+?fitdistr
+```
+
+```{r}
+round(epsilon.t.fit$estimate,6)
+```
+```{r}
+sd(fit.garch.t.results$residuals)*sqrt((4.783313-2)/4.783313 )
+```
+
+```{r}
+hist(epsilon.t,breaks = 100,freq=F,ylim=c(0,0.8))
+xfit <- seq(min(epsilon.t),max(epsilon.t),length=length(epsilon.t))
+yfit <- dt.scaled(xfit,mean=epsilon.t.fit$estimate[1],sd=epsilon.t.fit$estimate[2],df=epsilon.t.fit$estimate[3])
+lines(xfit,yfit,col="red",lwd=2)
+lines(density(epsilon.t),col="blue",lwd=2)
+legend("topright", legend = c("Theoretical","Empirical"), 
+       col = c("red", "blue"), lty = 1, lwd=2, bty = "n")
+```
+QQ-Plot
+```{r}
+epsilon.sample <- rt.scaled(xfit,mean=epsilon.t.fit$estimate[1],sd=epsilon.t.fit$estimate[2],df=epsilon.t.fit$estimate[3])
+ordered.epsilon.sample <- epsilon.sample[order(epsilon.sample)]
+ordred.epsilon <- epsilon.t[order(epsilon.t)]
+plot(ordered.epsilon.sample,ordred.epsilon,main="QQ plot for Scaled Student's t-distribution",xlab="Theoretical quantiles", ylab="Sample quantiles")
+abline(0,1,col="steelblue",lwd=2)
+```
+```{r}
+plot(ecdf(epsilon.t),col="blue")
+lines(x=xfit,y=cumsum(yfit)/max(cumsum(yfit)),col="red")
+legend("topright", legend = c("Theoretical","Empirical"), 
+       col = c("red", "blue"), lty = 1, lwd=2, bty = "n")
+```
+
+VaR , ES (change over time)
+```{r}
+set.seed(100)
+boot.garch <- ugarchboot(fit.garch.t,method=c("Partial","Full")[1],sampling="raw",
+n.ahead=1, n.bootpred=100000,solver="solnp")
+```
+
+```{r}
+# simulated outcomes
+rvec <- boot.garch@fseries
+```
+
+```{r}
+VaR <- quantile(rvec,0.01)
+ES <- mean(rvec[rvec<VaR])
+```
+
+```{r}
+VaR
+ES
+```
+VaR estimation using Garch(1,1) Model
+$$
+x_{\alpha} =  F_{\eta_t}^{-1}(\alpha)
+\\
+VaR_{\alpha}(t) = \hat{\mu} + \hat{\sigma}_{t+1}x_\alpha = \hat{\mu} + x_{\alpha}\sqrt{\hat{\omega} + \hat{\alpha}(r_t-\hat{\mu})^2+ \hat{\beta}\hat{\sigma}_{t}^2}
+$$
+
+```{r}
+garch.VaR <- function(alpha){
+  mu <- as.numeric(fit.garch.1.1@fit$coef["mu"])
+  omega <- as.numeric(fit.garch.1.1@fit$coef["omega"])
+  alpha1 <- as.numeric(fit.garch.1.1@fit$coef["alpha1"])
+  beta1 <- as.numeric(fit.garch.1.1@fit$coef["beta1"])
+  x.alpha <- quantile((logret-mu)/as.vector(garch.1.1.results$sigma),probs = alpha)
+  garch.var <- mu + x.alpha*sqrt(omega+alpha1*(logret-rep(mu,length(logret)))**2+beta1*as.vector(garch.1.1.results$sigma)**2)
+  return(garch.var)
+}
+```
+VaR estimation using t-Garch(1,1) Model
+$$
+VaR_{\alpha}(t) = \mu + \sigma_t t_{\alpha,v} \sqrt{\frac{v-2}{v}}
+$$
+```{r}
+v <- epsilon.t.fit$estimate[3]
+```
+
+```{r}
+garch.t.VaR <- function(alpha){
+  return(as.numeric(fit.garch.t@fit$coef["mu"])+fit.garch.t.results$sigma*qt(p=alpha, df=v, lower.tail = TRUE, log.p = FALSE)*sqrt((v-2)/v))
+}
+```
+
+
+```{r}
+alpha <- 0.01
+plot(as.vector(logret),type="l",ylim=c(-1.5,1))
+lines(as.vector(garch.VaR(alpha)),col="blue",lwd=2)
+lines(as.vector(garch.t.VaR(alpha)),col="red")
+legend("topleft", legend = c("Student Garch","Normal Garch"), 
+       col = c("red", "blue"), lty = 1, lwd=2, bty = "n")
+```
+
+# Conclusion
+In conclusion, our risk assessment approach encompasses various methodologies to calculate Value at Risk (VaR) for gas market short positions. We utilize both normal and student distribution models to capture different aspects of market behavior, providing a comprehensive view of potential losses. Additionally, we incorporate Extreme Value Theory to address extreme events that may not be adequately captured by traditional statistical methods. Furthermore, the Grach model is employed to account for the dynamic nature of volatility, enabling us to enhance the accuracy of our VaR estimates and better manage risks in the ever-evolving gas market landscape. This multi-faceted approach equips us with a robust risk assessment framework to navigate the complexities of gas market short positions.
+
+
